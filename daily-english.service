@@ -1,0 +1,14 @@
+[Unit]
+Description=Daily English Article Pusher - Fetch and push articles to Feishu
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/english-article/.venv/bin/python /opt/english-article/daily_english_article.py
+WorkingDirectory=/opt/english-article
+User=root
+Group=root
+StandardOutput=append:/opt/english-article/logs/run.log
+StandardError=append:/opt/english-article/logs/error.log
+PrivateTmp=true

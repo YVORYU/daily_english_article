@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily English Article Pusher - Daily timer (8:00 AM)
+Requires=daily-english.service
+
+[Timer]
+OnCalendar=*-*-* 08:00:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
