@@ -1,0 +1,22 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# Data
+data/
+
+# IDE
+.vscode/
+.idea/
+
+# Archives (may contain .env)
+*.zip
+
+# OS
+Thumbs.db
+.DS_Store
