@@ -584,7 +584,7 @@ class ArticleFetcher:
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
 
-    def get_latest_article(self) -> Optional[Dict]:
+    def get_latest_article(self, sent_ids: Optional[set] = None) -> Optional[Dict]:
         log.info("Fetching latest articles...")
         articles = []
         seen_slugs = set()
@@ -650,10 +650,14 @@ class ArticleFetcher:
                     data["level"] = level
                     data["source_url"] = url_to_try
                     data["pub_date"] = art["pub_date"]
+                    candidate_id = ArticleTracker.generate_id(url_to_try, data["title"])
+                    if sent_ids and candidate_id in sent_ids:
+                        log.info("Already sent (ID: %s), trying next article.", candidate_id)
+                        continue
                     log.info("Got article at Level %d: %s", level, data["title"])
                     return data
 
-        log.warning("Could not parse any article")
+        log.warning("Could not find any unsent article")
         return None
 
     @staticmethod
@@ -953,13 +957,13 @@ def run():
     # 1. Fetch
     log.info("=" * 50)
     log.info("Fetching latest article (push mode: %s)...", push_mode)
-    article = fetcher.get_latest_article()
+    article = fetcher.get_latest_article(tracker.sent)
     if not article:
         log.error("Failed to fetch article.")
         sys.exit(1)
     log.info("Article: %s (Level %d)", article["title"], article.get("level", 0))
 
-    # 2. Dedup
+    # 2. Dedup (safety net; get_latest_article already skips sent articles)
     article_id = ArticleTracker.generate_id(article.get("source_url", ""), article["title"])
     if tracker.is_sent(article_id):
         log.info("Already sent (ID: %s), skipping.", article_id)
