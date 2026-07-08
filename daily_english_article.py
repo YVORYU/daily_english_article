@@ -26,11 +26,12 @@ import hmac
 import base64
 import logging
 import traceback
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from pathlib import Path
-from typing import Optional, Dict
+from typing import Optional, Dict, List, Set
 from html import unescape
 from urllib.parse import urljoin
+import xml.etree.ElementTree as ET
 
 import requests
 from bs4 import BeautifulSoup
@@ -55,7 +56,13 @@ BNE_BASE_URL = "https://breakingnewsenglish.com/"
 BNE_LEVEL_PAGES = [
     (6, "https://breakingnewsenglish.com/news-for-kids.html"),
     (5, "https://breakingnewsenglish.com/english-news-readings.html"),
+    (4, "https://breakingnewsenglish.com/level-4.html"),
+    (3, "https://breakingnewsenglish.com/level-3.html"),
+    (2, "https://breakingnewsenglish.com/level-2.html"),
+    (1, "https://breakingnewsenglish.com/level-1.html"),
 ]
+
+BNE_RSS_URL = "https://breakingnewsenglish.com/rss.xml"
 
 HTTP_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
@@ -90,6 +97,11 @@ def load_config() -> dict:
         "tencent_secret_id": os.environ.get("TENCENT_SECRET_ID", "").strip(),
         "tencent_secret_key": os.environ.get("TENCENT_SECRET_KEY", "").strip(),
         "data_dir": os.environ.get("DATA_DIR", "./data").strip(),
+        "max_retry_attempts": int(os.environ.get("MAX_RETRY_ATTEMPTS", "3").strip()),
+        "retry_interval_seconds": int(os.environ.get("RETRY_INTERVAL_SECONDS", "3600").strip()),
+        "max_article_age_days": int(os.environ.get("MAX_ARTICLE_AGE_DAYS", "30").strip()),
+        "enable_rss_fallback": os.environ.get("ENABLE_RSS_FALLBACK", "true").strip().lower() == "true",
+        "resend_after_days": int(os.environ.get("RESEND_AFTER_DAYS", "30").strip()),
     }
 
     if push_mode == "webhook":
@@ -575,6 +587,73 @@ EXERCISE_SECTION_IDS = frozenset([
 ])
 
 
+BNE_RSS_URL = "https://breakingnewsenglish.com/rss.xml"
+
+
+def fetch_rss_articles(max_age_days: int = 30) -> list:
+    """Fetch articles from BNE RSS feed as fallback."""
+    log.info("Fetching RSS feed: %s", BNE_RSS_URL)
+    try:
+        resp = requests.get(BNE_RSS_URL, headers=HTTP_HEADERS, timeout=15)
+        resp.encoding = 'utf-8'
+        soup = BeautifulSoup(resp.text, 'xml')
+    except Exception as e:
+        log.warning("Failed to fetch RSS feed: %s", e)
+        return []
+
+    articles = []
+    cutoff_date = date.today() - timedelta(days=max_age_days)
+
+    for item in soup.find_all('item'):
+        title = item.find('title')
+        link = item.find('link')
+        pub_date = item.find('pubDate')
+
+        if not title or not link:
+            continue
+
+        title_text = title.get_text(strip=True)
+        link_text = link.get_text(strip=True)
+
+        pub_dt = None
+        if pub_date:
+            try:
+                pub_dt = datetime.strptime(pub_date.get_text(strip=True), "%a, %d %b %Y %H:%M:%S %z").date()
+            except ValueError:
+                try:
+                    pub_dt = datetime.strptime(pub_date.get_text(strip=True), "%a, %d %b %Y %H:%M:%S %Z").date()
+                except ValueError:
+                    pass
+
+        if pub_dt and pub_dt < cutoff_date:
+            continue
+
+        match = re.match(r'.*?(\d{4})/(\d{6})-.+\.html$', link_text)
+        if not match:
+            continue
+
+        try:
+            article_date = datetime.strptime.strptime(match.group(2), "%y%m%d").date()
+        except ValueError:
+            continue
+
+        if pub_dt and article_date != pub_dt:
+            article_date = pub_dt
+
+        level_match = re.search(r'-(\d+)\.html$', link_text)
+        articles.append({
+            "url": link_text,
+            "title": title_text,
+            "pub_date": article_date,
+            "slug": link_text.split('/')[-1],
+            "level": int(level_match.group(1)) if level_match else 6,
+        })
+
+    articles.sort(key=lambda x: x["pub_date"], reverse=True)
+    log.info("Found %d articles from RSS (max age %d days)", len(articles), max_age_days)
+    return articles
+
+
 class ArticleFetcher:
     """Fetch articles from Breaking News English.
     Priority: Level 6 (upper-intermediate) -> Level 5 (intermediate).
@@ -584,7 +663,9 @@ class ArticleFetcher:
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
 
-    def get_latest_article(self, sent_ids: Optional[set] = None) -> Optional[Dict]:
+    def get_latest_article(self, sent_ids: Optional[set] = None,
+                           resend_after_days: int = 0,
+                           max_scan: int = 200) -> Optional[Dict]:
         log.info("Fetching latest articles...")
         articles = []
         seen_slugs = set()
@@ -636,7 +717,7 @@ class ArticleFetcher:
                 unique.append(art)
         log.info("Found %d unique recent articles", len(unique))
 
-        for art in unique[:10]:
+        for art in unique[:max_scan]:
             base_url = re.sub(r'-\d+\.html$', '.html', art["url"])
             level5_url = re.sub(r'-\d+\.html$', '-5.html', art["url"])
             if art["level"] >= 6:
@@ -657,7 +738,24 @@ class ArticleFetcher:
                     log.info("Got article at Level %d: %s", level, data["title"])
                     return data
 
-        log.warning("Could not find any unsent article")
+        # Fallback: allow resending the oldest previously sent article
+        if sent_ids is not None and resend_after_days > 0:
+            log.info("No unsent article found. Trying to resend an old article...")
+            for art in reversed(unique[:max_scan]):
+                for label, url_to_try, level in [
+                    ("base_url_l6", re.sub(r'-\d+\.html$', '.html', art["url"]), 6),
+                    ("level_5", re.sub(r'-\d+\.html$', '-5.html', art["url"]), 5),
+                ]:
+                    data = self._fetch_article_content(url_to_try, level)
+                    if data:
+                        data["level"] = level
+                        data["source_url"] = url_to_try
+                        data["pub_date"] = art["pub_date"]
+                        data["is_resend"] = True
+                        log.info("Resending article at Level %d: %s", level, data["title"])
+                        return data
+
+        log.warning("Could not find any article to send")
         return None
 
     @staticmethod
@@ -909,26 +1007,43 @@ class ArticleTracker:
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
         self.sent = self._load()
 
-    def _load(self) -> set:
+    def _load(self) -> dict:
         if self.file_path.exists():
             try:
                 data = json.loads(self.file_path.read_text(encoding='utf-8'))
-                return set(data.get("sent", []))
+                entries = data.get("sent", {})
+                if isinstance(entries, list):
+                    return {e: None for e in entries}
+                if isinstance(entries, dict):
+                    return entries
             except (json.JSONDecodeError, KeyError):
-                return set()
-        return set()
+                pass
+        return {}
 
     def _save(self):
         self.file_path.write_text(
-            json.dumps({"sent": list(self.sent)}, ensure_ascii=False, indent=2),
+            json.dumps({"sent": self.sent}, ensure_ascii=False, indent=2),
             encoding='utf-8',
         )
 
-    def is_sent(self, article_id: str) -> bool:
-        return article_id in self.sent
+    def get_sent_ids(self, resend_after_days: int = 0) -> set:
+        if resend_after_days <= 0:
+            return set(self.sent.keys())
+        cutoff = date.today() - timedelta(days=resend_after_days)
+        result = set()
+        for aid, ts in self.sent.items():
+            if ts is None:
+                result.add(aid)
+            else:
+                try:
+                    if datetime.strptime(ts, "%Y-%m-%d").date() >= cutoff:
+                        result.add(aid)
+                except ValueError:
+                    result.add(aid)
+        return result
 
     def mark_sent(self, article_id: str):
-        self.sent.add(article_id)
+        self.sent[article_id] = date.today().strftime("%Y-%m-%d")
         self._save()
 
     @staticmethod
@@ -957,15 +1072,19 @@ def run():
     # 1. Fetch
     log.info("=" * 50)
     log.info("Fetching latest article (push mode: %s)...", push_mode)
-    article = fetcher.get_latest_article(tracker.sent)
+    resend_after_days = config["resend_after_days"]
+    sent_ids = tracker.get_sent_ids(resend_after_days)
+    article = fetcher.get_latest_article(sent_ids, resend_after_days)
     if not article:
-        log.error("Failed to fetch article.")
-        sys.exit(1)
+        log.info("No article available today. Next BNE article expected Monday.")
+        log.info("Script will retry tomorrow at 08:00.")
+        return
     log.info("Article: %s (Level %d)", article["title"], article.get("level", 0))
 
     # 2. Dedup (safety net; get_latest_article already skips sent articles)
     article_id = ArticleTracker.generate_id(article.get("source_url", ""), article["title"])
-    if tracker.is_sent(article_id):
+    sent_ids_now = tracker.get_sent_ids(resend_after_days)
+    if article_id in sent_ids_now:
         log.info("Already sent (ID: %s), skipping.", article_id)
         return
 
@@ -997,6 +1116,8 @@ def run():
 
     # 5. Send
     title_line = f"Daily English Reading | {article['title']}"
+    if article.get("is_resend"):
+        title_line += " [重温]"
     log.info("Sending to Feishu...")
     try:
         if push_mode == "webhook":
